@@ -36,18 +36,18 @@ class CorefModel(object):
     self.eval_data = None # Load eval data lazily.
 
     input_props = []
-    input_props.append((tf.string, [None, None])) # Tokens.
-    input_props.append((tf.float32, [None, None, self.context_embeddings.size])) # Context embeddings.
-    input_props.append((tf.float32, [None, None, self.head_embeddings.size])) # Head embeddings.
-    input_props.append((tf.float32, [None, None, self.lm_size, self.lm_layers])) # LM embeddings.
-    input_props.append((tf.int32, [None, None, None])) # Character indices.
-    input_props.append((tf.int32, [None])) # Text lengths.
-    input_props.append((tf.int32, [None])) # Speaker IDs.
-    input_props.append((tf.int32, [])) # Genre.
-    input_props.append((tf.bool, [])) # Is training.
-    input_props.append((tf.int32, [None])) # Gold starts.
-    input_props.append((tf.int32, [None])) # Gold ends.
-    input_props.append((tf.int32, [None])) # Cluster ids.
+    input_props.append((tf.string, [None, None]))  # Tokens: shape=[num_sentence, max_sentence_length]
+    input_props.append((tf.float32, [None, None, self.context_embeddings.size]))  # Context embeddings: shape=[num_sentence, max_sentence_length, embedding_size]
+    input_props.append((tf.float32, [None, None, self.head_embeddings.size]))  # Head embeddings: shape=[num_sentence, max_sentence_length, embedding_size]
+    input_props.append((tf.float32, [None, None, self.lm_size, self.lm_layers]))  # LM embeddings: shape=[num_sentences, max_sentence_length, 1024, 3]
+    input_props.append((tf.int32, [None, None, None]))  # Character indices: shape=[num_sentence, max_sentence_length, max_word_length]
+    input_props.append((tf.int32, [None]))  # Text lengths: shape=[num_sentence]
+    input_props.append((tf.int32, [None]))  # Speaker IDs: shape=[num_words]
+    input_props.append((tf.int32, []))  # Genre.
+    input_props.append((tf.bool, []))  # Is training.
+    input_props.append((tf.int32, [None]))  # Gold starts: shape=[num_mentions]
+    input_props.append((tf.int32, [None]))  # Gold ends: shape=[num_mentions]
+    input_props.append((tf.int32, [None]))  # Cluster ids: shape=[num_mentions]
 
     self.queue_input_tensors = [tf.placeholder(dtype, shape) for dtype, shape in input_props]
     dtypes, shapes = zip(*input_props)
@@ -190,6 +190,17 @@ class CorefModel(object):
 
     return tokens, context_word_emb, head_word_emb, lm_emb, char_index, text_len, speaker_ids, genre, is_training, gold_starts, gold_ends, cluster_ids
 
+  """
+  example:
+  labeled_starts = tf.constant([0,3,4])
+  labeled_ends = tf.constant(  [1,4,4])
+  labels = tf.constant([1,1,2])
+  candidate_starts = tf.constant([0, 0, 1, 2, 2, 2, 3, 3, 4])
+  candidate_ends = tf.constant(  [0, 1, 1, 2, 3, 4, 3, 4, 4])
+  output:
+  <tf.Tensor: shape=(9,), dtype=int32, numpy=array([0, 1, 0, 0, 0, 0, 0, 1, 2], dtype=int32)>
+
+  """
   def get_candidate_labels(self, candidate_starts, candidate_ends, labeled_starts, labeled_ends, labels):
     same_start = tf.equal(tf.expand_dims(labeled_starts, 1), tf.expand_dims(candidate_starts, 0)) # [num_labeled, num_candidates]
     same_end = tf.equal(tf.expand_dims(labeled_ends, 1), tf.expand_dims(candidate_ends, 0)) # [num_labeled, num_candidates]
@@ -271,17 +282,68 @@ class CorefModel(object):
     context_emb = tf.nn.dropout(context_emb, self.lexical_dropout) # [num_sentences, max_sentence_length, emb]
     head_emb = tf.nn.dropout(head_emb, self.lexical_dropout) # [num_sentences, max_sentence_length, emb]
 
-    text_len_mask = tf.sequence_mask(text_len, maxlen=max_sentence_length) # [num_sentence, max_sentence_length]
+    text_len_mask = tf.sequence_mask(text_len, maxlen=max_sentence_length) # [num_sentence, max_sentence_length] در هر سطر به تعداد طول آن جمله ۱ و بقیه ۰ است
 
-    context_outputs = self.lstm_contextualize(context_emb, text_len, text_len_mask) # [num_words, emb]
+    context_outputs = self.lstm_contextualize(context_emb, text_len, text_len_mask) # [num_words, emb] x* in the paper
     num_words = util.shape(context_outputs, 0)
 
     genre_emb = tf.gather(tf.get_variable("genre_embeddings", [len(self.genres), self.config["feature_size"]]), genre) # [emb]
 
-    sentence_indices = tf.tile(tf.expand_dims(tf.range(num_sentences), 1), [1, max_sentence_length]) # [num_sentences, max_sentence_length]
-    flattened_sentence_indices = self.flatten_emb_by_sentence(sentence_indices, text_len_mask) # [num_words]
-    flattened_head_emb = self.flatten_emb_by_sentence(head_emb, text_len_mask) # [num_words]
+    sentence_indices = tf.tile(tf.expand_dims(tf.range(num_sentences), 1), [1, max_sentence_length]) # [num_sentences, max_sentence_length] در هر سطر به تعداد تمام کلمات آن اندیس جمله مشخص شده است. سطر اول همه ۰ بعدی همه ۱ و الی آخر
+    flattened_sentence_indices = self.flatten_emb_by_sentence(sentence_indices, text_len_mask) # [num_words] یک آرایه به طول کل تعداد کلمات که هر مقدار نشان‌دهنده آی‌دی جمله در برگیرنده آن کلمه است
+    flattened_head_emb = self.flatten_emb_by_sentence(head_emb, text_len_mask) # [num_words, emb] یک آرایه به طول تعداد کل کلمات که هر عضو آن یک آرایه دیگر نشان‌دهنده امبدینگ آن کلمه است
 
+
+    """
+    example:
+    max_span_width: 3
+    num_words: 5
+    
+    candidate_starts:
+      tf.Tensor(
+      [[0 0 0]
+       [1 1 1]
+       [2 2 2]
+       [3 3 3]
+       [4 4 4]], shape=(5, 3), dtype=int32)
+    candidate_ends:
+      tf.Tensor(
+      [[0 1 2]
+       [1 2 3]
+       [2 3 4]
+       [3 4 5]
+       [4 5 6]], shape=(5, 3), dtype=int32)
+    candidate_start_sentence_indices:
+      tf.Tensor(
+      [[0 0 0]
+       [0 0 0]
+       [1 1 1]
+       [1 1 1]
+       [1 1 1]], shape=(5, 3), dtype=int32)
+    candidate_end_sentence_indices:
+      tf.Tensor(
+      [[0 0 1]
+       [0 1 1]
+       [1 1 1]
+       [1 1 1]
+       [1 1 1]], shape=(5, 3), dtype=int32)
+    candidate_mask: هر جایی که شروع اسپن متناظر در یک جمله بود و انتهای آن در جمله دیگر آن را فالس می‌کند. حالت دیگر فالس شدن زمانی است که انتهای اسپن از تعداد کل کلمات بیشتر شود
+      tf.Tensor(
+      [[ True  True False]
+       [ True False False]
+       [ True  True  True]
+       [ True  True False]
+       [ True False False]], shape=(5, 3), dtype=bool)
+    flattened_candidate_mask:
+      tf.Tensor(
+      [ True  True False  True False False  True  True  True  True  True False True False False], shape=(15,), dtype=bool)
+    final candidate_starts:
+      tf.Tensor([0 0 1 2 2 2 3 3 4], shape=(9,), dtype=int32)
+    final candidate_ends:
+      tf.Tensor([0 1 1 2 3 4 3 4 4], shape=(9,), dtype=int32)
+    candidate_sentence_indices:
+      tf.Tensor([0 0 0 1 1 1 1 1 1], shape=(9,), dtype=int32)
+    """
     candidate_starts = tf.tile(tf.expand_dims(tf.range(num_words), 1), [1, self.max_span_width]) # [num_words, max_span_width]
     candidate_ends = candidate_starts + tf.expand_dims(tf.range(self.max_span_width), 0) # [num_words, max_span_width]
     candidate_start_sentence_indices = tf.gather(flattened_sentence_indices, candidate_starts) # [num_words, max_span_width]
@@ -292,7 +354,7 @@ class CorefModel(object):
     candidate_ends = tf.boolean_mask(tf.reshape(candidate_ends, [-1]), flattened_candidate_mask) # [num_candidates]
     candidate_sentence_indices = tf.boolean_mask(tf.reshape(candidate_start_sentence_indices, [-1]), flattened_candidate_mask) # [num_candidates]
 
-    candidate_cluster_ids = self.get_candidate_labels(candidate_starts, candidate_ends, gold_starts, gold_ends, cluster_ids) # [num_candidates]
+    candidate_cluster_ids = self.get_candidate_labels(candidate_starts, candidate_ends, gold_starts, gold_ends, cluster_ids) # [num_candidates] با توجه به اینکه آی‌دی کلاسترها از ۱ شروع می‌شود خروجی این مرحله به ازای هر اسپن کاندید یا صفر است که نشان می‌دهد اسپن در هیچ کلاستری نیست و یا آی‌دی کلاستر است.
 
     candidate_span_emb = self.get_span_emb(flattened_head_emb, context_outputs, candidate_starts, candidate_ends) # [num_candidates, emb]
     candidate_mention_scores =  self.get_mention_scores(candidate_span_emb) # [k, 1]
@@ -442,6 +504,25 @@ class CorefModel(object):
     target_top_span_emb = tf.nn.dropout(top_span_emb, self.dropout) # [k, emb]
     return tf.matmul(source_top_span_emb, target_top_span_emb, transpose_b=True) # [k, k]
 
+  """
+  example (rank2):
+  emb = tf.constant([[0,0,0,0],[1,1,1,1],[2,2,2,2]])
+  text_len_mask = tf.constant([[True, True, False, False],[True, True, True, False],[True, False, False, False]])
+  output: <tf.Tensor: shape=(6,), dtype=int32, numpy=array([0, 0, 1, 1, 1, 2], dtype=int32)>
+  example (rank3):
+  sen = tf.constant([[[0.1,0.2,0.3],[0.1,0.2,0.3],[0.1,0.2,0.3],[0.1,0.2,0.3]],
+                     [[0.2,0.3,0.4],[0.2,0.3,0.4],[0.2,0.3,0.4],[0.2,0.3,0.4]],
+                     [[0.3,0.4,0.5],[0.3,0.4,0.5],[0.3,0.4,0.5],[0.3,0.4,0.5]]])
+  text_len_mask = tf.constant([[True, True, False, False],[True, True, True, False],[True, False, False, False]])
+  output: <tf.Tensor: shape=(6, 3), dtype=float32, numpy=
+            array([[0.1, 0.2, 0.3],
+                   [0.1, 0.2, 0.3],
+                   [0.2, 0.3, 0.4],
+                   [0.2, 0.3, 0.4],
+                   [0.2, 0.3, 0.4],
+                   [0.3, 0.4, 0.5]], dtype=float32)>
+
+  """
   def flatten_emb_by_sentence(self, emb, text_len_mask):
     num_sentences = tf.shape(emb)[0]
     max_sentence_length = tf.shape(emb)[1]
